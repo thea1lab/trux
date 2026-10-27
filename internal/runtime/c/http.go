@@ -55,10 +55,24 @@ const HTTPSource = `
 #define RT_BUF_SIZE 4096
 #define RT_BUF_GROUP_ID 1
 #define RT_MAX_CONNS 65536
-#define RT_HTTP_UDATA_ACCEPT ((uint64_t)-1)
-#define RT_HTTP_UDATA_SEND (1ULL << 32)
-#define RT_HTTP_UDATA_GPU (2ULL << 32)
-#define RT_HTTP_UDATA_GPU_TIMEOUT (3ULL << 32)
+#define RT_HTTP_MAX_RINGS 8
+#define RT_HTTP_DIRECT_SLOTS_DEFAULT 65536
+#define RT_HTTP_SINGLE_ACCEPTS 128
+#define RT_HTTP_BUF_INITIAL 4096
+#define RT_HTTP_BUF_POOL 16
+#define RT_HTTP_BUF_POOL_MAX 65536
+#define RT_HTTP_OP_RECV 1u
+#define RT_HTTP_OP_ACCEPT 2u
+#define RT_HTTP_OP_SEND 3u
+#define RT_HTTP_OP_CLOSE 4u
+#define RT_HTTP_OP_SOCKOPT 5u
+#define RT_HTTP_OP_GPU 6u
+#define RT_HTTP_OP_GPU_TIMEOUT 7u
+#define RT_HTTP_OP_CANCEL 8u
+#define RT_HTTP_OP_SHUTDOWN 9u
+#ifndef SOCKET_URING_OP_SETSOCKOPT
+#define SOCKET_URING_OP_SETSOCKOPT 3
+#endif
 
 typedef int64_t (*rt_http_handler_fn)(rt_context* trux_ctx, rt_arena* trux_result_arena, int64_t request);
 
@@ -96,8 +110,13 @@ typedef struct {
 
 static rt_http_router g_trux_http_router = {0};
 
+typedef struct rt_http_ring rt_http_ring;
+typedef struct rt_http_worker rt_http_worker;
+
 typedef struct {
     int fd;
+    int slot;
+    int ring_index;
     uint8_t* buffer;
     size_t len;
     size_t cap;
@@ -109,13 +128,44 @@ typedef struct {
     bool tx_in_flight;
     bool close_after_tx;
     bool in_use;
-    int next_ready_fd;
+    bool closing;
+    bool drain_after_tx;
+    int next_ready_ring;
+    int next_ready_slot;
     bool in_ready_queue;
 } rt_http_conn;
 
+struct rt_http_ring {
+    struct io_uring ring;
+    struct io_uring_buf_ring* br;
+    uint8_t* buf_storage;
+    rt_http_conn* conns;
+    unsigned nslots;
+    unsigned live;
+    int index;
+    int listen_fd;
+    int singles;
+    int multi_on;
+    int pending_submit;
+    bool fixed;
+    bool active;
+    rt_http_worker* worker;
+};
+
+struct rt_http_worker {
+    rt_http_ring rings[RT_HTTP_MAX_RINGS];
+    int nrings;
+    int listen_fd;
+    int wait_cursor;
+    unsigned slots;
+    bool fixed;
+};
+
 typedef struct {
     int fd;
+    int ring_index;
     struct io_uring* ring;
+    rt_http_ring* http_ring;
     bool* need_submit;
     rt_http_conn* conn;
     const uint8_t* method;
@@ -154,8 +204,15 @@ static __thread rt_http_gpu_park* g_rt_http_parked;
 static __thread rt_http_gpu_park g_rt_http_park_storage;
 static __thread rt_http_request g_rt_http_park_req_storage;
 static __thread rt_context g_rt_http_worker_ctx;
-static __thread int g_rt_http_ready_head = -1;
-static __thread int g_rt_http_ready_tail = -1;
+static __thread int g_rt_http_ready_head_ring = -1;
+static __thread int g_rt_http_ready_head_slot = -1;
+static __thread int g_rt_http_ready_tail_ring = -1;
+static __thread int g_rt_http_ready_tail_slot = -1;
+static __thread rt_http_worker* g_rt_http_worker;
+static __thread uint8_t* rt_http_pool_ptr[RT_HTTP_BUF_POOL];
+static __thread size_t rt_http_pool_cap[RT_HTTP_BUF_POOL];
+static __thread int rt_http_pool_n;
+static int g_rt_http_tcp_nodelay = 1;
 static __thread int g_rt_http_in_continuation;
 static __thread uint32_t g_rt_http_gpu_gen;
 static __thread uint32_t g_rt_http_gpu_timer_gen;
@@ -319,20 +376,6 @@ static RT_UNUSED bool rt_http_send_all_iov(int fd, struct iovec* iov, int iovcnt
     return true;
 }
 
-static RT_UNUSED void rt_http_send_simple(int fd, int status, const char* body, bool close_conn) {
-    char header[256];
-    size_t body_len = strlen(body);
-    int n = snprintf(header, sizeof(header),
-        "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: %s\r\n\r\n",
-        status, rt_http_reason(status), body_len, close_conn ? "close" : "keep-alive");
-    if (n < 0 || (size_t)n >= sizeof(header)) return;
-    struct iovec iov[2] = {
-        {(void*)header, (size_t)n},
-        {(void*)body, body_len},
-    };
-    (void)rt_http_send_all_iov(fd, iov, body_len == 0 ? 1 : 2);
-}
-
 static RT_UNUSED rt_string rt_http_clone_string(rt_arena* arena, const uint8_t* data, size_t len) {
     if (len == 0 || data == NULL) return RT_LIT(rt_string, NULL, 0);
     uint8_t* out = (uint8_t*)rt_arena_alloc(arena, len);
@@ -448,6 +491,307 @@ static RT_UNUSED void rt_http_set_header(int64_t handle, rt_string name, rt_stri
     }
 }
 
+static RT_UNUSED uint64_t rt_http_ud(unsigned op, unsigned ring, unsigned slot) {
+    return ((uint64_t)op << 56) | ((uint64_t)ring << 48) | (uint64_t)slot;
+}
+
+static RT_UNUSED unsigned rt_http_ud_op(uint64_t ud) {
+    return (unsigned)(ud >> 56);
+}
+
+static RT_UNUSED unsigned rt_http_ud_ring(uint64_t ud) {
+    return (unsigned)((ud >> 48) & 0xffu);
+}
+
+static RT_UNUSED unsigned rt_http_ud_slot(uint64_t ud) {
+    return (unsigned)ud;
+}
+
+static RT_UNUSED void rt_http_buf_release(uint8_t* p, size_t cap) {
+    if (p == NULL) return;
+    if (cap == 0 || cap > RT_HTTP_BUF_POOL_MAX || rt_http_pool_n >= RT_HTTP_BUF_POOL) {
+        free(p);
+        return;
+    }
+    rt_http_pool_ptr[rt_http_pool_n] = p;
+    rt_http_pool_cap[rt_http_pool_n] = cap;
+    rt_http_pool_n++;
+}
+
+static RT_UNUSED uint8_t* rt_http_buf_acquire(size_t* cap) {
+    if (rt_http_pool_n > 0) {
+        rt_http_pool_n--;
+        *cap = rt_http_pool_cap[rt_http_pool_n];
+        uint8_t* p = rt_http_pool_ptr[rt_http_pool_n];
+        rt_http_pool_ptr[rt_http_pool_n] = NULL;
+        rt_http_pool_cap[rt_http_pool_n] = 0;
+        return p;
+    }
+    *cap = RT_HTTP_BUF_INITIAL;
+    return (uint8_t*)malloc(*cap);
+}
+
+static RT_UNUSED int rt_http_buf_reserve(rt_http_conn* c, size_t need) {
+    if (c->buffer != NULL && need <= c->cap) return 1;
+    size_t ncap = c->cap >= (size_t)RT_HTTP_BUF_INITIAL ? c->cap : (size_t)RT_HTTP_BUF_INITIAL;
+    while (ncap < need) {
+        if (ncap > (SIZE_MAX / 2)) return 0;
+        ncap *= 2;
+    }
+    size_t limit = (size_t)RT_HTTP_MAX_HEADER_BYTES + (size_t)RT_HTTP_MAX_BODY_BYTES;
+    if (need > limit) return 0;
+    if (ncap > limit) ncap = limit;
+    if (ncap < need) return 0;
+    uint8_t* nbuf = (uint8_t*)realloc(c->buffer, ncap);
+    if (nbuf == NULL) return 0;
+    c->buffer = nbuf;
+    c->cap = ncap;
+    return 1;
+}
+
+static RT_UNUSED void rt_http_release_idle_in(rt_http_conn* c) {
+    if (c->len != 0 || c->buffer == NULL) return;
+    rt_http_buf_release(c->buffer, c->cap);
+    c->buffer = NULL;
+    c->cap = 0;
+    c->header_scan_start = 0;
+}
+
+static RT_UNUSED void rt_http_release_tx(rt_http_conn* c) {
+    if (c->tx_buf == NULL || c->tx_in_flight) return;
+    rt_http_buf_release(c->tx_buf, c->tx_cap);
+    c->tx_buf = NULL;
+    c->tx_cap = 0;
+    c->tx_sent = 0;
+    c->tx_total = 0;
+}
+
+static RT_UNUSED void rt_http_conn_free_bufs(rt_http_conn* c) {
+    c->tx_in_flight = false;
+    if (c->buffer != NULL) {
+        rt_http_buf_release(c->buffer, c->cap);
+        c->buffer = NULL;
+        c->cap = 0;
+    }
+    if (c->tx_buf != NULL) {
+        rt_http_buf_release(c->tx_buf, c->tx_cap);
+        c->tx_buf = NULL;
+        c->tx_cap = 0;
+    }
+    c->len = 0;
+    c->tx_sent = 0;
+    c->tx_total = 0;
+    c->header_scan_start = 0;
+}
+
+static RT_UNUSED int rt_http_tx_reserve(rt_http_conn* c, size_t need) {
+    if (c->tx_buf != NULL && c->tx_cap >= need) return 1;
+    if (c->tx_buf != NULL) {
+        rt_http_buf_release(c->tx_buf, c->tx_cap);
+        c->tx_buf = NULL;
+        c->tx_cap = 0;
+    }
+    for (int i = 0; i < rt_http_pool_n; i++) {
+        if (rt_http_pool_cap[i] >= need) {
+            c->tx_buf = rt_http_pool_ptr[i];
+            c->tx_cap = rt_http_pool_cap[i];
+            rt_http_pool_n--;
+            rt_http_pool_ptr[i] = rt_http_pool_ptr[rt_http_pool_n];
+            rt_http_pool_cap[i] = rt_http_pool_cap[rt_http_pool_n];
+            rt_http_pool_ptr[rt_http_pool_n] = NULL;
+            rt_http_pool_cap[rt_http_pool_n] = 0;
+            return 1;
+        }
+    }
+    size_t cap = RT_HTTP_BUF_INITIAL;
+    while (cap < need) {
+        if (cap > (SIZE_MAX / 2)) return 0;
+        cap *= 2;
+    }
+    c->tx_buf = (uint8_t*)malloc(cap);
+    if (c->tx_buf == NULL) return 0;
+    c->tx_cap = cap;
+    return 1;
+}
+
+static RT_UNUSED struct io_uring_sqe* rt_http_get_sqe(rt_http_ring* r) {
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&r->ring);
+    if (sqe == NULL) {
+        io_uring_submit(&r->ring);
+        r->pending_submit = 0;
+        sqe = io_uring_get_sqe(&r->ring);
+    }
+    return sqe;
+}
+
+static RT_UNUSED void rt_http_mark_submit(rt_http_ring* r, bool* need_submit) {
+    r->pending_submit = 1;
+    if (need_submit != NULL) *need_submit = true;
+}
+
+static RT_UNUSED int rt_http_ring_has_room(const rt_http_ring* r) {
+    unsigned inflight = (unsigned)r->singles + (r->multi_on ? 1u : 0u);
+    return r->live + inflight < r->nslots;
+}
+
+static RT_UNUSED unsigned rt_http_single_target(const rt_http_ring* r) {
+    unsigned want = RT_HTTP_SINGLE_ACCEPTS;
+    if (r->nslots < want * 2u) {
+        want = r->nslots / 4u;
+        if (want < 1u) want = 1u;
+    }
+    return want;
+}
+
+static RT_UNUSED void rt_http_close_conn(rt_http_ring* r, rt_http_conn* c, bool* need_submit);
+
+static RT_UNUSED bool rt_http_queue_send(rt_http_ring* r, rt_http_conn* c, bool* need_submit) {
+    if (r == NULL || c == NULL || c->tx_buf == NULL || c->tx_total <= c->tx_sent) return false;
+    struct io_uring_sqe* sqe = rt_http_get_sqe(r);
+    if (sqe == NULL) return false;
+    io_uring_prep_send(sqe, c->fd, c->tx_buf + c->tx_sent, c->tx_total - c->tx_sent, MSG_NOSIGNAL);
+    if (r->fixed) sqe->flags |= IOSQE_FIXED_FILE;
+    sqe->user_data = rt_http_ud(RT_HTTP_OP_SEND, (unsigned)r->index, (unsigned)c->slot);
+    c->tx_in_flight = true;
+    rt_http_mark_submit(r, need_submit);
+    return true;
+}
+
+static RT_UNUSED void rt_http_arm_recv(rt_http_ring* r, rt_http_conn* c, bool* need_submit) {
+    if (c == NULL || !c->in_use || c->closing) return;
+    struct io_uring_sqe* sqe = rt_http_get_sqe(r);
+    if (sqe == NULL) return;
+    io_uring_prep_recv_multishot(sqe, c->fd, NULL, 0, 0);
+    sqe->flags |= IOSQE_BUFFER_SELECT;
+    if (r->fixed) sqe->flags |= IOSQE_FIXED_FILE;
+    sqe->buf_group = RT_BUF_GROUP_ID;
+    sqe->user_data = rt_http_ud(RT_HTTP_OP_RECV, (unsigned)r->index, (unsigned)c->slot);
+    rt_http_mark_submit(r, need_submit);
+}
+
+static RT_UNUSED void rt_http_queue_nodelay(rt_http_ring* r, rt_http_conn* c, bool* need_submit) {
+    struct io_uring_sqe* sqe = rt_http_get_sqe(r);
+    if (sqe == NULL) return;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_URING_CMD;
+    sqe->fd = c->fd;
+    sqe->cmd_op = SOCKET_URING_OP_SETSOCKOPT;
+    sqe->addr = ((uint64_t)TCP_NODELAY << 32) | (uint32_t)IPPROTO_TCP;
+    sqe->file_index = (uint32_t)sizeof(g_rt_http_tcp_nodelay);
+    sqe->addr3 = (uint64_t)(uintptr_t)&g_rt_http_tcp_nodelay;
+    sqe->flags = IOSQE_FIXED_FILE;
+    sqe->user_data = rt_http_ud(RT_HTTP_OP_SOCKOPT, (unsigned)r->index, (unsigned)c->slot);
+    rt_http_mark_submit(r, need_submit);
+}
+
+static RT_UNUSED void rt_http_arm_accept(rt_http_ring* r, int multi, bool* need_submit) {
+    if (!rt_http_ring_has_room(r)) return;
+    struct io_uring_sqe* sqe = rt_http_get_sqe(r);
+    if (sqe == NULL) return;
+    if (r->fixed) {
+        if (multi) io_uring_prep_multishot_accept_direct(sqe, r->listen_fd, NULL, NULL, 0);
+        else io_uring_prep_accept_direct(sqe, r->listen_fd, NULL, NULL, 0, IORING_FILE_INDEX_ALLOC);
+    } else if (multi) {
+        io_uring_prep_multishot_accept(sqe, r->listen_fd, NULL, NULL, 0);
+    } else {
+        io_uring_prep_accept(sqe, r->listen_fd, NULL, NULL, 0);
+    }
+    sqe->user_data = rt_http_ud(RT_HTTP_OP_ACCEPT, (unsigned)r->index, multi ? 0u : 1u);
+    if (multi) r->multi_on = 1;
+    else r->singles++;
+    rt_http_mark_submit(r, need_submit);
+}
+
+static RT_UNUSED void rt_http_arm_accepts(rt_http_ring* r, bool* need_submit) {
+    if (r == NULL || !r->active) return;
+    if (!r->multi_on && rt_http_ring_has_room(r)) rt_http_arm_accept(r, 1, need_submit);
+    unsigned want = rt_http_single_target(r);
+    while ((unsigned)r->singles < want && rt_http_ring_has_room(r)) {
+        int before = r->singles;
+        rt_http_arm_accept(r, 0, need_submit);
+        if (r->singles == before) break;
+    }
+}
+
+static RT_UNUSED void rt_http_queue_fixed_close(rt_http_ring* r, rt_http_conn* c, bool* need_submit) {
+    struct io_uring_sqe* shut = rt_http_get_sqe(r);
+    if (shut != NULL) {
+        io_uring_prep_shutdown(shut, c->fd, SHUT_RDWR);
+        shut->flags |= IOSQE_FIXED_FILE;
+        shut->user_data = rt_http_ud(RT_HTTP_OP_SHUTDOWN, (unsigned)r->index, (unsigned)c->slot);
+        rt_http_mark_submit(r, need_submit);
+    }
+    struct io_uring_sqe* sqe = rt_http_get_sqe(r);
+    if (sqe == NULL) return;
+    io_uring_prep_close_direct(sqe, (unsigned)c->slot);
+    sqe->user_data = rt_http_ud(RT_HTTP_OP_CLOSE, (unsigned)r->index, (unsigned)c->slot);
+    rt_http_mark_submit(r, need_submit);
+}
+
+static RT_UNUSED void rt_http_close_conn(rt_http_ring* r, rt_http_conn* c, bool* need_submit) {
+    if (r == NULL || c == NULL || !c->in_use || c->closing) return;
+    c->closing = true;
+    if (!r->fixed) {
+        shutdown(c->fd, SHUT_RDWR);
+        close(c->fd);
+        rt_http_conn_free_bufs(c);
+        c->in_use = false;
+        c->closing = false;
+        if (r->live > 0) r->live--;
+        rt_http_arm_accepts(r, need_submit);
+        return;
+    }
+    /* A multishot recv never finishes, and a later close waits behind it.
+       Cancel every request on the direct descriptor first. */
+    struct io_uring_sqe* sqe = rt_http_get_sqe(r);
+    if (sqe == NULL) {
+        c->closing = false;
+        return;
+    }
+    io_uring_prep_cancel_fd(sqe, c->fd, IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED);
+    sqe->user_data = rt_http_ud(RT_HTTP_OP_CANCEL, (unsigned)r->index, (unsigned)c->slot);
+    rt_http_mark_submit(r, need_submit);
+}
+
+static RT_UNUSED void rt_http_send_simple(rt_http_ring* r, rt_http_conn* c, int status, const char* body, bool close_conn, bool* need_submit) {
+    if (r == NULL || c == NULL || !c->in_use || c->closing) return;
+    char header[256];
+    size_t body_len = body == NULL ? 0 : strlen(body);
+    int n = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: %s\r\n\r\n",
+        status, rt_http_reason(status), body_len, close_conn ? "close" : "keep-alive");
+    if (n < 0 || (size_t)n >= sizeof(header)) {
+        rt_http_close_conn(r, c, need_submit);
+        return;
+    }
+    size_t total = (size_t)n + body_len;
+    if (c->tx_in_flight || !rt_http_tx_reserve(c, total)) {
+        c->close_after_tx = true;
+        if (!c->tx_in_flight) rt_http_close_conn(r, c, need_submit);
+        return;
+    }
+    memcpy(c->tx_buf, header, (size_t)n);
+    if (body_len > 0) memcpy(c->tx_buf + (size_t)n, body, body_len);
+    c->tx_sent = 0;
+    c->tx_total = total;
+    c->close_after_tx = close_conn;
+    if (!rt_http_queue_send(r, c, need_submit)) {
+        if (!r->fixed) {
+            struct iovec iov;
+            memset(&iov, 0, sizeof(iov));
+            iov.iov_base = c->tx_buf;
+            iov.iov_len = total;
+            if (rt_http_send_all_iov(c->fd, &iov, 1)) {
+                c->tx_in_flight = false;
+                if (close_conn) rt_http_close_conn(r, c, need_submit);
+                else rt_http_release_tx(c);
+                return;
+            }
+        }
+        rt_http_close_conn(r, c, need_submit);
+    }
+}
+
 static RT_UNUSED void rt_http_respond(int64_t handle, int64_t status, rt_string content_type, rt_string body) {
     rt_http_request* req = rt_http_request_from_handle(handle);
     if (req->responded) return;
@@ -490,57 +834,42 @@ static RT_UNUSED void rt_http_respond(int64_t handle, int64_t status, rt_string 
     size_t body_len = (body.len > 0 && body.data != NULL) ? body.len : 0;
     size_t total_len = (size_t)pos + body_len;
 
-    if (req->ring != NULL && req->conn != NULL && !req->conn->tx_in_flight && total_len <= 65536) {
-        if (req->conn->tx_buf == NULL) {
-            req->conn->tx_cap = 8192;
-            while (req->conn->tx_cap < total_len) req->conn->tx_cap *= 2;
-            req->conn->tx_buf = (uint8_t*)malloc(req->conn->tx_cap);
-        } else if (total_len > req->conn->tx_cap) {
-            size_t ncap = req->conn->tx_cap * 2;
-            while (ncap < total_len) ncap *= 2;
-            uint8_t* nbuf = (uint8_t*)realloc(req->conn->tx_buf, ncap);
-            if (nbuf) {
-                req->conn->tx_buf = nbuf;
-                req->conn->tx_cap = ncap;
-            }
+    if (req->http_ring != NULL && req->conn != NULL && !req->conn->closing) {
+        if (req->conn->tx_in_flight || !rt_http_tx_reserve(req->conn, total_len)) {
+            req->close_after_response = true;
+            req->responded = true;
+            if (!req->conn->tx_in_flight) rt_http_close_conn(req->http_ring, req->conn, req->need_submit);
+            else req->conn->close_after_tx = true;
+            return;
         }
-        if (req->conn->tx_buf != NULL && total_len <= req->conn->tx_cap) {
-            memcpy(req->conn->tx_buf, header, (size_t)pos);
-            if (body_len > 0) {
-                memcpy(req->conn->tx_buf + (size_t)pos, body.data, body_len);
-            }
-            struct io_uring_sqe* sqe = io_uring_get_sqe(req->ring);
-            if (!sqe) {
-                io_uring_submit(req->ring);
-                sqe = io_uring_get_sqe(req->ring);
-            }
-            if (sqe) {
-                io_uring_prep_send(sqe, req->fd, req->conn->tx_buf, total_len, MSG_NOSIGNAL);
-                sqe->user_data = RT_HTTP_UDATA_SEND | (uint64_t)(uint32_t)req->fd;
-                req->conn->tx_in_flight = true;
-                req->conn->tx_sent = 0;
-                req->conn->tx_total = total_len;
-                req->conn->close_after_tx = req->close_after_response;
-                if (req->need_submit) *req->need_submit = true;
+        memcpy(req->conn->tx_buf, header, (size_t)pos);
+        if (body_len > 0) memcpy(req->conn->tx_buf + (size_t)pos, body.data, body_len);
+        req->conn->tx_sent = 0;
+        req->conn->tx_total = total_len;
+        req->conn->close_after_tx = req->close_after_response;
+        if (rt_http_queue_send(req->http_ring, req->conn, req->need_submit)) {
+            req->responded = true;
+            return;
+        }
+        if (!req->http_ring->fixed) {
+            struct iovec iov;
+            memset(&iov, 0, sizeof(iov));
+            iov.iov_base = req->conn->tx_buf;
+            iov.iov_len = total_len;
+            if (rt_http_send_all_iov(req->fd, &iov, 1)) {
+                req->conn->tx_in_flight = false;
+                if (req->close_after_response) rt_http_close_conn(req->http_ring, req->conn, req->need_submit);
+                else rt_http_release_tx(req->conn);
                 req->responded = true;
                 return;
             }
         }
+        rt_http_close_conn(req->http_ring, req->conn, req->need_submit);
+        req->responded = true;
+        return;
     }
 
-    if (req->ring != NULL && req->conn != NULL && req->conn->tx_in_flight) {
-        io_uring_submit(req->ring);
-        if (req->need_submit) *req->need_submit = false;
-    }
-
-    struct iovec iov[2] = {
-        {(void*)header, (size_t)pos},
-        {(void*)body.data, body.len},
-    };
-    int iovcnt = (body.len > 0 && body.data != NULL) ? 2 : 1;
-    if (!rt_http_send_all_iov(req->fd, iov, iovcnt)) {
-        req->close_after_response = true;
-    }
+    req->close_after_response = true;
     req->responded = true;
 }
 
@@ -653,7 +982,7 @@ static RT_UNUSED void rt_http_arm_gpu_poll(struct io_uring* ring, bool* need_sub
     }
     if (sqe == NULL) return;
     io_uring_prep_poll_add(sqe, fd, POLLIN);
-    sqe->user_data = RT_HTTP_UDATA_GPU;
+    sqe->user_data = rt_http_ud(RT_HTTP_OP_GPU, 0, 0);
     if (need_submit != NULL) *need_submit = true;
 }
 
@@ -670,7 +999,7 @@ static RT_UNUSED void rt_http_arm_gpu_timeout(struct io_uring* ring, bool* need_
     g_rt_http_gpu_timer_gen = g_rt_http_gpu_gen;
     g_rt_http_gpu_timer_armed = true;
     io_uring_prep_timeout(sqe, &g_rt_http_gpu_ts, 0, 0);
-    sqe->user_data = RT_HTTP_UDATA_GPU_TIMEOUT | (uint64_t)g_rt_http_gpu_timer_gen;
+    sqe->user_data = rt_http_ud(RT_HTTP_OP_GPU_TIMEOUT, 0, g_rt_http_gpu_timer_gen);
     if (need_submit != NULL) *need_submit = true;
 }
 
@@ -689,18 +1018,21 @@ static RT_UNUSED void rt_http_trim_worker_pool(rt_context* ctx) {
     }
 }
 
-static RT_UNUSED void rt_http_enqueue_ready(rt_http_conn* conns, int fd) {
-    if (conns == NULL || fd < 0 || fd >= RT_MAX_CONNS) return;
-    rt_http_conn* c = &conns[fd];
-    if (!c->in_use || c->len == 0 || c->in_ready_queue) return;
-    c->next_ready_fd = -1;
+static RT_UNUSED void rt_http_enqueue_ready(rt_http_conn* c) {
+    if (c == NULL || g_rt_http_worker == NULL || !c->in_use || c->len == 0 || c->in_ready_queue || c->closing) return;
+    c->next_ready_ring = -1;
+    c->next_ready_slot = -1;
     c->in_ready_queue = true;
-    if (g_rt_http_ready_tail >= 0) {
-        conns[g_rt_http_ready_tail].next_ready_fd = fd;
+    if (g_rt_http_ready_tail_ring >= 0) {
+        rt_http_conn* tail = &g_rt_http_worker->rings[g_rt_http_ready_tail_ring].conns[g_rt_http_ready_tail_slot];
+        tail->next_ready_ring = c->ring_index;
+        tail->next_ready_slot = c->slot;
     } else {
-        g_rt_http_ready_head = fd;
+        g_rt_http_ready_head_ring = c->ring_index;
+        g_rt_http_ready_head_slot = c->slot;
     }
-    g_rt_http_ready_tail = fd;
+    g_rt_http_ready_tail_ring = c->ring_index;
+    g_rt_http_ready_tail_slot = c->slot;
 }
 
 static RT_UNUSED void rt_http_gpu_finish(int64_t handle, rt_http_handler_fn continuation) {
@@ -796,7 +1128,7 @@ static RT_UNUSED void rt_http_dispatch(rt_http_request* req) {
         } else if (g_trux_http_router.not_found_handler != NULL) {
             g_trux_http_router.not_found_handler(&g_rt_http_worker_ctx, &arena, (int64_t)(intptr_t)req);
         } else {
-            rt_http_send_simple(req->fd, 404, "not found\n", req->close_after_response);
+            rt_http_send_simple(req->http_ring, req->conn, 404, "not found\n", req->close_after_response, req->need_submit);
             req->responded = true;
         }
     }
@@ -808,7 +1140,7 @@ static RT_UNUSED void rt_http_dispatch(rt_http_request* req) {
     }
 
     if (!req->responded) {
-        rt_http_send_simple(req->fd, 500, "handler did not respond\n", req->close_after_response);
+        rt_http_send_simple(req->http_ring, req->conn, 500, "handler did not respond\n", req->close_after_response, req->need_submit);
         req->responded = true;
     }
 
@@ -822,17 +1154,21 @@ typedef struct {
     int worker_index;
 } rt_http_thread_args;
 
-static RT_UNUSED void rt_http_drain_conn(rt_http_conn* conns, rt_http_conn* c, int client_fd, struct io_uring* ring, bool* need_submit) {
-    if (c == NULL || !c->in_use) return;
+static RT_UNUSED void rt_http_drain_conn(rt_http_ring* r, rt_http_conn* c, bool* need_submit) {
+    if (r == NULL || c == NULL || !c->in_use || c->closing) return;
+    if (c->tx_in_flight) {
+        c->drain_after_tx = true;
+        return;
+    }
     for (;;) {
+        if (c->buffer == NULL || c->len == 0) {
+            rt_http_release_idle_in(c);
+            return;
+        }
         ssize_t hdr_end = rt_http_find_header_end(c->buffer, c->len, c->header_scan_start);
         if (hdr_end < 0) {
             if (c->len > RT_HTTP_MAX_HEADER_BYTES) {
-                rt_http_send_simple(client_fd, 431, "request header fields too large\n", true);
-                shutdown(client_fd, SHUT_RDWR);
-                close(client_fd);
-                c->in_use = false;
-                c->len = 0;
+                rt_http_send_simple(r, c, 431, "request header fields too large\n", true, need_submit);
                 return;
             }
             if (c->len > 3) c->header_scan_start = c->len - 3;
@@ -841,27 +1177,21 @@ static RT_UNUSED void rt_http_drain_conn(rt_http_conn* conns, rt_http_conn* c, i
 
         rt_http_request req;
         memset(&req, 0, sizeof(req));
-        req.fd = client_fd;
-        req.ring = ring;
+        req.fd = c->slot;
+        req.ring_index = r->index;
+        req.ring = &r->ring;
+        req.http_ring = r;
         req.need_submit = need_submit;
         req.conn = c;
 
         size_t content_length = 0;
         if (!rt_http_parse_request_headers(c->buffer, c->len, (size_t)hdr_end, &req, &content_length)) {
-            rt_http_send_simple(client_fd, 400, "bad request\n", true);
-            shutdown(client_fd, SHUT_RDWR);
-            close(client_fd);
-            c->in_use = false;
-            c->len = 0;
+            rt_http_send_simple(r, c, 400, "bad request\n", true, need_submit);
             return;
         }
 
         if (content_length > RT_HTTP_MAX_BODY_BYTES) {
-            rt_http_send_simple(client_fd, 413, "payload too large\n", true);
-            shutdown(client_fd, SHUT_RDWR);
-            close(client_fd);
-            c->in_use = false;
-            c->len = 0;
+            rt_http_send_simple(r, c, 413, "payload too large\n", true, need_submit);
             return;
         }
 
@@ -870,15 +1200,15 @@ static RT_UNUSED void rt_http_drain_conn(rt_http_conn* conns, rt_http_conn* c, i
         if (g_rt_http_parked != NULL) {
             bool matches_gpu = false;
             for (size_t i = 0; i < g_trux_http_router.route_count; i++) {
-                rt_http_route_entry* r = &g_trux_http_router.routes[i];
-                if (r->uses_gpu && rt_http_token_equal_ci(r->method.data, r->method.len, req.method, req.method_len) &&
-                    rt_http_match_route(r->path, req.path, req.path_len, req.params, &req.param_count, RT_HTTP_MAX_PARAMS)) {
+                rt_http_route_entry* route = &g_trux_http_router.routes[i];
+                if (route->uses_gpu && rt_http_token_equal_ci(route->method.data, route->method.len, req.method, req.method_len) &&
+                    rt_http_match_route(route->path, req.path, req.path_len, req.params, &req.param_count, RT_HTTP_MAX_PARAMS)) {
                     matches_gpu = true;
                     break;
                 }
             }
             if (matches_gpu) {
-                rt_http_enqueue_ready(conns, client_fd);
+                rt_http_enqueue_ready(c);
                 return;
             }
         }
@@ -898,44 +1228,62 @@ static RT_UNUSED void rt_http_drain_conn(rt_http_conn* conns, rt_http_conn* c, i
         }
 
         if (req.parked) {
-            if (c->len > 0) {
-                rt_http_enqueue_ready(conns, client_fd);
-            }
+            if (c->len == 0) rt_http_release_idle_in(c);
+            else rt_http_enqueue_ready(c);
             return;
         }
 
-        if (req.close_after_response) {
+        if (req.close_after_response || c->close_after_tx) {
             if (c->tx_in_flight) {
                 c->close_after_tx = true;
                 return;
             }
-            shutdown(client_fd, SHUT_RDWR);
-            close(client_fd);
-            c->in_use = false;
-            c->len = 0;
+            if (c->in_use && !c->closing) rt_http_close_conn(r, c, need_submit);
             return;
         }
 
-        if (c->len == 0) return;
-    }
-}
-
-static RT_UNUSED void rt_http_drain_ready(rt_http_conn* conns, struct io_uring* ring, bool* need_submit) {
-    while (g_rt_http_ready_head >= 0 && g_rt_http_parked == NULL) {
-        int fd = g_rt_http_ready_head;
-        rt_http_conn* c = &conns[fd];
-        g_rt_http_ready_head = c->next_ready_fd;
-        if (g_rt_http_ready_head < 0) {
-            g_rt_http_ready_tail = -1;
+        if (c->tx_in_flight) {
+            if (c->len > 0) c->drain_after_tx = true;
+            else rt_http_release_idle_in(c);
+            return;
         }
-        c->next_ready_fd = -1;
-        c->in_ready_queue = false;
-        if (!c->in_use || c->len == 0) continue;
-        rt_http_drain_conn(conns, c, fd, ring, need_submit);
+
+        if (c->len == 0) {
+            rt_http_release_idle_in(c);
+            return;
+        }
     }
 }
 
-static RT_UNUSED void rt_http_gpu_release(struct io_uring* ring, rt_http_conn* conns, bool* need_submit, int failed) {
+static RT_UNUSED void rt_http_drain_ready(bool* need_submit) {
+    rt_http_worker* w = g_rt_http_worker;
+    while (g_rt_http_ready_head_ring >= 0 && g_rt_http_parked == NULL && w != NULL) {
+        int ring_i = g_rt_http_ready_head_ring;
+        int slot = g_rt_http_ready_head_slot;
+        if (ring_i < 0 || ring_i >= w->nrings || (unsigned)slot >= w->rings[ring_i].nslots) {
+            g_rt_http_ready_head_ring = -1;
+            g_rt_http_ready_head_slot = -1;
+            g_rt_http_ready_tail_ring = -1;
+            g_rt_http_ready_tail_slot = -1;
+            return;
+        }
+        rt_http_ring* hr = &w->rings[ring_i];
+        rt_http_conn* c = &hr->conns[slot];
+        g_rt_http_ready_head_ring = c->next_ready_ring;
+        g_rt_http_ready_head_slot = c->next_ready_slot;
+        if (g_rt_http_ready_head_ring < 0) {
+            g_rt_http_ready_tail_ring = -1;
+            g_rt_http_ready_tail_slot = -1;
+        }
+        c->next_ready_ring = -1;
+        c->next_ready_slot = -1;
+        c->in_ready_queue = false;
+        if (!c->in_use || c->len == 0 || c->closing) continue;
+        rt_http_drain_conn(hr, c, need_submit);
+    }
+}
+
+static RT_UNUSED void rt_http_gpu_release(struct io_uring* ring, bool* need_submit, int failed) {
     rt_http_gpu_park* park = g_rt_http_parked;
     if (park == NULL) {
         rt_http_arm_gpu_poll(ring, need_submit);
@@ -946,12 +1294,22 @@ static RT_UNUSED void rt_http_gpu_release(struct io_uring* ring, rt_http_conn* c
     g_rt_http_gpu_timer_armed = false;
     rt_gpu_clear_busy();
     rt_http_request* req = park->req;
-    int fd = req->fd;
-    int alive = fd >= 0 && fd < RT_MAX_CONNS && conns[fd].in_use;
+    rt_http_worker* w = g_rt_http_worker;
+    rt_http_ring* hr = NULL;
+    rt_http_conn* conn = NULL;
+    int alive = 0;
+    if (w != NULL && req->ring_index >= 0 && req->ring_index < w->nrings) {
+        hr = &w->rings[req->ring_index];
+        if (req->fd >= 0 && (unsigned)req->fd < hr->nslots) {
+            conn = &hr->conns[req->fd];
+            alive = conn->in_use && !conn->closing;
+        }
+    }
     if (alive) {
-        req->ring = ring;
+        req->ring = &hr->ring;
+        req->http_ring = hr;
         req->need_submit = need_submit;
-        req->conn = &conns[fd];
+        req->conn = conn;
         if (!failed && park->cont != NULL) {
             g_rt_http_in_continuation = 1;
             park->cont(park->slot.ctx, park->slot.arena, (int64_t)(intptr_t)req);
@@ -959,36 +1317,353 @@ static RT_UNUSED void rt_http_gpu_release(struct io_uring* ring, rt_http_conn* c
         }
         if (!req->responded) {
             const char* body = failed ? "gpu request failed\n" : "handler did not respond\n";
-            rt_http_send_simple(fd, 500, body, req->close_after_response);
+            rt_http_send_simple(hr, conn, 500, body, req->close_after_response, need_submit);
             req->responded = true;
         }
         if (req->close_after_response) {
-            rt_http_conn* c = &conns[fd];
-            if (c->tx_in_flight) {
-                c->close_after_tx = true;
-            } else if (c->in_use) {
-                shutdown(fd, SHUT_RDWR);
-                close(fd);
-                c->in_use = false;
-                c->len = 0;
-            }
+            if (conn->tx_in_flight) conn->close_after_tx = true;
+            else if (conn->in_use) rt_http_close_conn(hr, conn, need_submit);
         }
     }
     if (park->slot.arena != NULL && park->slot.ctx != NULL) {
         rt_arena_deinit(park->slot.arena);
-        rt_arena_chunk* c = park->slot.ctx->chunk_pool;
-        while (c != NULL) {
-            rt_arena_chunk* next = c->next;
-            c->next = g_rt_http_worker_ctx.chunk_pool;
-            g_rt_http_worker_ctx.chunk_pool = c;
-            c = next;
+        rt_arena_chunk* chunk = park->slot.ctx->chunk_pool;
+        while (chunk != NULL) {
+            rt_arena_chunk* next = chunk->next;
+            chunk->next = g_rt_http_worker_ctx.chunk_pool;
+            g_rt_http_worker_ctx.chunk_pool = chunk;
+            chunk = next;
         }
         park->slot.ctx->chunk_pool = NULL;
         rt_http_trim_worker_pool(&g_rt_http_worker_ctx);
     }
     rt_http_park_complete(&park->slot, 1);
     rt_http_arm_gpu_poll(ring, need_submit);
-    rt_http_drain_ready(conns, ring, need_submit);
+    rt_http_drain_ready(need_submit);
+}
+
+static RT_UNUSED unsigned rt_http_direct_slots(void) {
+    const char* env = getenv("TRUX_HTTP_DIRECT_SLOTS");
+    if (env == NULL || env[0] == '\0') return RT_HTTP_DIRECT_SLOTS_DEFAULT;
+    char* end = NULL;
+    long value = strtol(env, &end, 10);
+    if (end == env || value < 8 || value > 262144) return RT_HTTP_DIRECT_SLOTS_DEFAULT;
+    return (unsigned)value;
+}
+
+static RT_UNUSED int rt_http_env_on(const char* name) {
+    const char* env = getenv(name);
+    return env != NULL && env[0] == '1';
+}
+
+static RT_UNUSED void rt_http_ring_fail_cleanup(rt_http_ring* r, int fixed, int ring_ready) {
+    if (r->conns != NULL) {
+        free(r->conns);
+        r->conns = NULL;
+    }
+    if (r->br != NULL && ring_ready) {
+        io_uring_free_buf_ring(&r->ring, r->br, RT_BUF_RING_SIZE, RT_BUF_GROUP_ID);
+        r->br = NULL;
+    }
+    if (r->buf_storage != NULL) {
+        free(r->buf_storage);
+        r->buf_storage = NULL;
+    }
+    if (ring_ready) {
+        if (fixed) io_uring_unregister_files(&r->ring);
+        io_uring_queue_exit(&r->ring);
+    }
+}
+
+static RT_UNUSED int rt_http_open_ring(rt_http_ring* r, rt_http_worker* w, int index, int listen_fd, int fixed) {
+    memset(r, 0, sizeof(*r));
+    r->index = index;
+    r->listen_fd = listen_fd;
+    r->worker = w;
+    r->fixed = fixed ? true : false;
+    r->nslots = fixed ? w->slots : (unsigned)RT_MAX_CONNS;
+    struct io_uring_params params;
+    memset(&params, 0, sizeof(params));
+#ifdef IORING_SETUP_COOP_TASKRUN
+    params.flags |= IORING_SETUP_COOP_TASKRUN;
+#endif
+#ifdef IORING_SETUP_SINGLE_ISSUER
+    params.flags |= IORING_SETUP_SINGLE_ISSUER;
+#endif
+#ifdef IORING_SETUP_DEFER_TASKRUN
+    params.flags |= IORING_SETUP_DEFER_TASKRUN;
+#endif
+    int ret = io_uring_queue_init_params(RT_URING_ENTRIES, &r->ring, &params);
+    if (ret < 0) {
+        ret = io_uring_queue_init(RT_URING_ENTRIES, &r->ring, 0);
+        if (ret < 0) return -1;
+    }
+    if (fixed) {
+        ret = io_uring_register_files_sparse(&r->ring, r->nslots);
+        if (ret < 0) {
+            io_uring_queue_exit(&r->ring);
+            return -2;
+        }
+    }
+    if (posix_memalign((void**)&r->buf_storage, 4096, (size_t)RT_BUF_RING_SIZE * (size_t)RT_BUF_SIZE) != 0) {
+        rt_http_ring_fail_cleanup(r, fixed, 1);
+        return -1;
+    }
+    int err = 0;
+    r->br = io_uring_setup_buf_ring(&r->ring, RT_BUF_RING_SIZE, RT_BUF_GROUP_ID, 0, &err);
+    if (r->br == NULL) {
+        rt_http_ring_fail_cleanup(r, fixed, 1);
+        return -1;
+    }
+    for (int i = 0; i < RT_BUF_RING_SIZE; i++) {
+        io_uring_buf_ring_add(r->br, r->buf_storage + (size_t)i * RT_BUF_SIZE, RT_BUF_SIZE, i,
+            io_uring_buf_ring_mask(RT_BUF_RING_SIZE), i);
+    }
+    io_uring_buf_ring_advance(r->br, RT_BUF_RING_SIZE);
+    r->conns = (rt_http_conn*)calloc(r->nslots, sizeof(rt_http_conn));
+    if (r->conns == NULL) {
+        rt_http_ring_fail_cleanup(r, fixed, 1);
+        return -1;
+    }
+    for (unsigned i = 0; i < r->nslots; i++) {
+        r->conns[i].slot = (int)i;
+        r->conns[i].fd = (int)i;
+        r->conns[i].ring_index = index;
+        r->conns[i].next_ready_ring = -1;
+        r->conns[i].next_ready_slot = -1;
+    }
+    r->active = true;
+    return 0;
+}
+
+static RT_UNUSED void rt_http_maybe_grow(rt_http_worker* w) {
+    if (w == NULL || !w->fixed || w->nrings <= 0 || w->nrings >= RT_HTTP_MAX_RINGS) return;
+    rt_http_ring* last = &w->rings[w->nrings - 1];
+    if (last->live + 1u < last->nslots) return;
+    int idx = w->nrings;
+    if (rt_http_open_ring(&w->rings[idx], w, idx, w->listen_fd, 1) != 0) return;
+    w->nrings++;
+    rt_http_arm_accepts(&w->rings[idx], NULL);
+}
+
+static RT_UNUSED void rt_http_on_accept(rt_http_ring* r, unsigned kind, int res, unsigned flags, bool* need_submit) {
+    int multi = kind == 0u;
+    if (!multi && r->singles > 0) r->singles--;
+    if (multi && (flags & IORING_CQE_F_MORE) == 0) r->multi_on = 0;
+    if (res < 0) {
+        if (res == -ENFILE || res == -EMFILE) rt_http_maybe_grow(r->worker);
+        rt_http_arm_accepts(r, need_submit);
+        return;
+    }
+    unsigned slot;
+    int fd;
+    if (r->fixed) {
+        slot = (unsigned)res;
+        if (slot >= r->nslots) {
+            rt_http_arm_accepts(r, need_submit);
+            return;
+        }
+        fd = (int)slot;
+    } else {
+        if (res >= (int)r->nslots) {
+            close(res);
+            rt_http_arm_accepts(r, need_submit);
+            return;
+        }
+        slot = (unsigned)res;
+        fd = res;
+    }
+    rt_http_conn* c = &r->conns[slot];
+    if (c->in_use) {
+        if (!r->fixed) close(fd);
+        rt_http_arm_accepts(r, need_submit);
+        return;
+    }
+    c->fd = fd;
+    c->slot = (int)slot;
+    c->ring_index = r->index;
+    c->len = 0;
+    c->header_scan_start = 0;
+    c->tx_in_flight = false;
+    c->tx_sent = 0;
+    c->tx_total = 0;
+    c->close_after_tx = false;
+    c->closing = false;
+    c->drain_after_tx = false;
+    c->in_ready_queue = false;
+    c->in_use = true;
+    r->live++;
+    if (r->fixed) rt_http_queue_nodelay(r, c, need_submit);
+    else {
+        int one = 1;
+        (void)setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+    rt_http_arm_recv(r, c, need_submit);
+    rt_http_maybe_grow(r->worker);
+    rt_http_arm_accepts(r, need_submit);
+}
+
+static RT_UNUSED void rt_http_on_send(rt_http_ring* r, rt_http_conn* c, int res, bool* need_submit) {
+    if (c == NULL || !c->in_use) return;
+    if (res > 0) {
+        c->tx_sent += (size_t)res;
+        if (c->tx_sent < c->tx_total) {
+            c->tx_in_flight = false;
+            if (!rt_http_queue_send(r, c, need_submit)) rt_http_close_conn(r, c, need_submit);
+            return;
+        }
+    }
+    c->tx_in_flight = false;
+    c->tx_sent = 0;
+    c->tx_total = 0;
+    if (res <= 0 || c->close_after_tx) {
+        rt_http_close_conn(r, c, need_submit);
+        return;
+    }
+    rt_http_release_tx(c);
+    if (c->len > 0 || c->drain_after_tx) {
+        c->drain_after_tx = false;
+        rt_http_drain_conn(r, c, need_submit);
+    } else {
+        rt_http_release_idle_in(c);
+    }
+}
+
+static RT_UNUSED void rt_http_recycle_buf(rt_http_ring* r, unsigned flags) {
+    int bid = (int)(flags >> IORING_CQE_BUFFER_SHIFT);
+    if (r->br == NULL || r->buf_storage == NULL || bid < 0 || bid >= RT_BUF_RING_SIZE) return;
+    uint8_t* in_data = r->buf_storage + (size_t)bid * RT_BUF_SIZE;
+    io_uring_buf_ring_add(r->br, in_data, RT_BUF_SIZE, bid, io_uring_buf_ring_mask(RT_BUF_RING_SIZE), 0);
+    io_uring_buf_ring_advance(r->br, 1);
+}
+
+static RT_UNUSED void rt_http_on_recv(rt_http_ring* r, rt_http_conn* c, int res, unsigned flags, bool* need_submit) {
+    if (res > 0 && c->in_use && !c->closing) {
+        int bid = (int)(flags >> IORING_CQE_BUFFER_SHIFT);
+        if (bid < 0 || bid >= RT_BUF_RING_SIZE || r->buf_storage == NULL) {
+            rt_http_recycle_buf(r, flags);
+            rt_http_close_conn(r, c, need_submit);
+            return;
+        }
+        size_t bytes = (size_t)res;
+        if (c->buffer == NULL) {
+            size_t cap = 0;
+            c->buffer = rt_http_buf_acquire(&cap);
+            c->cap = c->buffer == NULL ? 0 : cap;
+        }
+        if (!rt_http_buf_reserve(c, c->len + bytes)) {
+            rt_http_recycle_buf(r, flags);
+            rt_http_close_conn(r, c, need_submit);
+            return;
+        }
+        memcpy(c->buffer + c->len, r->buf_storage + (size_t)bid * RT_BUF_SIZE, bytes);
+        c->len += bytes;
+        rt_http_recycle_buf(r, flags);
+        rt_http_drain_conn(r, c, need_submit);
+        if (c->in_use && !c->closing && (flags & IORING_CQE_F_MORE) == 0) {
+            rt_http_arm_recv(r, c, need_submit);
+        }
+        return;
+    }
+    if ((flags & IORING_CQE_F_BUFFER) != 0) rt_http_recycle_buf(r, flags);
+    if (!c->in_use || c->closing) return;
+    if (res == -ENOBUFS) {
+        rt_http_arm_recv(r, c, need_submit);
+        return;
+    }
+    rt_http_close_conn(r, c, need_submit);
+}
+
+static RT_UNUSED void rt_http_handle_gpu(rt_http_ring* r, unsigned op, unsigned slot, bool* need_submit) {
+    struct io_uring* ring = &r->ring;
+    if (op == RT_HTTP_OP_GPU) {
+        rt_gpu_drain_eventfd();
+        int query = rt_gpu_query_job();
+        if (g_rt_http_parked == NULL) {
+            if (query == 1) rt_gpu_reset_stream();
+            rt_http_arm_gpu_poll(ring, need_submit);
+        } else if (query == 0) {
+            rt_http_arm_gpu_poll(ring, need_submit);
+        } else if (query == 1) {
+            rt_gpu_reset_stream();
+            rt_http_gpu_release(ring, need_submit, 1);
+        } else {
+            rt_http_gpu_release(ring, need_submit, 0);
+        }
+        return;
+    }
+    g_rt_http_gpu_timer_armed = false;
+    if (g_rt_http_parked != NULL && slot == g_rt_http_gpu_gen) {
+        int query = rt_gpu_query_job();
+        if (query == 0) rt_http_arm_gpu_timeout(ring, need_submit);
+        else if (query == 1) {
+            rt_gpu_reset_stream();
+            rt_http_gpu_release(ring, need_submit, 1);
+        } else {
+            rt_http_gpu_release(ring, need_submit, 0);
+        }
+    }
+}
+
+static RT_UNUSED void rt_http_drain_cq(rt_http_ring* r) {
+    struct io_uring_cqe* cqe;
+    unsigned head;
+    bool need_submit = false;
+    io_uring_for_each_cqe(&r->ring, head, cqe) {
+        uint64_t udata = cqe->user_data;
+        unsigned op = rt_http_ud_op(udata);
+        unsigned slot = rt_http_ud_slot(udata);
+        int res = cqe->res;
+        unsigned flags = cqe->flags;
+        io_uring_cq_advance(&r->ring, 1);
+        if (op == RT_HTTP_OP_GPU || op == RT_HTTP_OP_GPU_TIMEOUT) {
+            rt_http_handle_gpu(r, op, slot, &need_submit);
+        } else if (op == RT_HTTP_OP_ACCEPT) {
+            rt_http_on_accept(r, slot, res, flags, &need_submit);
+        } else if (op == RT_HTTP_OP_CANCEL) {
+            if (slot < r->nslots && r->conns[slot].in_use) {
+                rt_http_queue_fixed_close(r, &r->conns[slot], &need_submit);
+            }
+        } else if (op == RT_HTTP_OP_SHUTDOWN) {
+            (void)res;
+        } else if (op == RT_HTTP_OP_CLOSE) {
+            if (slot < r->nslots) {
+                rt_http_conn* c = &r->conns[slot];
+                rt_http_conn_free_bufs(c);
+                if (c->in_use && r->live > 0) r->live--;
+                c->in_use = false;
+                c->closing = false;
+            }
+            rt_http_arm_accepts(r, &need_submit);
+        } else if (op == RT_HTTP_OP_SEND) {
+            if (slot < r->nslots) rt_http_on_send(r, &r->conns[slot], res, &need_submit);
+        } else if (op == RT_HTTP_OP_RECV) {
+            if (slot < r->nslots) rt_http_on_recv(r, &r->conns[slot], res, flags, &need_submit);
+        }
+    }
+    if (need_submit) r->pending_submit = 1;
+    (void)head;
+}
+
+static RT_UNUSED void rt_http_flush(rt_http_worker* w) {
+    for (int i = 0; i < w->nrings; i++) {
+        rt_http_ring* r = &w->rings[i];
+        if (!r->active) continue;
+        if (r->pending_submit) {
+            io_uring_submit_and_get_events(&r->ring);
+            r->pending_submit = 0;
+        } else {
+            io_uring_get_events(&r->ring);
+        }
+    }
+}
+
+static RT_UNUSED int rt_http_has_cqe(rt_http_worker* w) {
+    for (int i = 0; i < w->nrings; i++) {
+        struct io_uring_cqe* cqe;
+        if (io_uring_peek_cqe(&w->rings[i].ring, &cqe) == 0) return 1;
+    }
+    return 0;
 }
 
 static RT_UNUSED void* rt_http_worker_thread(void* arg) {
@@ -1019,7 +1694,6 @@ static RT_UNUSED void* rt_http_worker_thread(void* arg) {
     if (inet_pton(AF_INET, targs->host, &addr.sin_addr) != 1) {
         rt_runtime_fail("invalid http host IP address");
     }
-
     if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         rt_runtime_fail("worker bind failed");
     }
@@ -1027,282 +1701,88 @@ static RT_UNUSED void* rt_http_worker_thread(void* arg) {
         rt_runtime_fail("worker listen failed");
     }
 
-    struct io_uring ring;
-    struct io_uring_params params;
-    memset(&params, 0, sizeof(params));
-#ifdef IORING_SETUP_COOP_TASKRUN
-    params.flags |= IORING_SETUP_COOP_TASKRUN;
-#endif
-#ifdef IORING_SETUP_SINGLE_ISSUER
-    params.flags |= IORING_SETUP_SINGLE_ISSUER;
-#endif
-#ifdef IORING_SETUP_DEFER_TASKRUN
-    params.flags |= IORING_SETUP_DEFER_TASKRUN;
-#endif
-    int ret = io_uring_queue_init_params(RT_URING_ENTRIES, &ring, &params);
-    if (ret < 0) {
-        ret = io_uring_queue_init(RT_URING_ENTRIES, &ring, 0);
-        if (ret < 0) rt_runtime_fail("io_uring_queue_init failed");
+    rt_http_worker worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.listen_fd = listen_fd;
+    worker.slots = rt_http_direct_slots();
+    g_rt_http_worker = &worker;
+    g_rt_http_ready_head_ring = -1;
+    g_rt_http_ready_head_slot = -1;
+    g_rt_http_ready_tail_ring = -1;
+    g_rt_http_ready_tail_slot = -1;
+
+    int opened = 0;
+    if (!rt_http_env_on("TRUX_HTTP_NO_DIRECT")) {
+        int rc = rt_http_open_ring(&worker.rings[0], &worker, 0, listen_fd, 1);
+        if (rc == 0) {
+            worker.nrings = 1;
+            worker.fixed = true;
+            opened = 1;
+        } else if (rc != -2 || rt_http_env_on("TRUX_HTTP_REQUIRE_DIRECT")) {
+            rt_runtime_fail(rc == -2 ? "io_uring direct descriptors are unavailable" : "io_uring setup failed");
+        }
+    } else if (rt_http_env_on("TRUX_HTTP_REQUIRE_DIRECT")) {
+        rt_runtime_fail("io_uring direct descriptors are unavailable");
     }
-
-    uint8_t* buf_storage = NULL;
-    if (posix_memalign((void**)&buf_storage, 4096, RT_BUF_RING_SIZE * RT_BUF_SIZE) != 0) {
-        rt_runtime_fail("posix_memalign for buf ring failed");
+    if (!opened) {
+        if (rt_http_open_ring(&worker.rings[0], &worker, 0, listen_fd, 0) != 0) {
+            rt_runtime_fail("io_uring_queue_init failed");
+        }
+        worker.nrings = 1;
+        worker.fixed = false;
     }
-
-    int err = 0;
-    struct io_uring_buf_ring* br = io_uring_setup_buf_ring(&ring, RT_BUF_RING_SIZE, RT_BUF_GROUP_ID, 0, &err);
-    if (!br) rt_runtime_fail("io_uring_setup_buf_ring failed");
-
-    for (int i = 0; i < RT_BUF_RING_SIZE; i++) {
-        io_uring_buf_ring_add(br, buf_storage + i * RT_BUF_SIZE, RT_BUF_SIZE, i, io_uring_buf_ring_mask(RT_BUF_RING_SIZE), i);
-    }
-    io_uring_buf_ring_advance(br, RT_BUF_RING_SIZE);
-
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_multishot_accept(sqe, listen_fd, NULL, NULL, 0);
-    sqe->user_data = (uint64_t)-1;
-    io_uring_submit(&ring);
-
-    rt_http_conn* conns = (rt_http_conn*)calloc(RT_MAX_CONNS, sizeof(rt_http_conn));
-    if (!conns) rt_runtime_fail("failed to allocate connection pool");
 
     rt_gpu_worker_init();
     {
         bool arm_gpu = false;
-        rt_http_arm_gpu_poll(&ring, &arm_gpu);
-        if (arm_gpu) io_uring_submit(&ring);
+        rt_http_arm_gpu_poll(&worker.rings[0].ring, &arm_gpu);
+        if (arm_gpu) worker.rings[0].pending_submit = 1;
     }
+    rt_http_arm_accepts(&worker.rings[0], NULL);
+    rt_http_flush(&worker);
 
     for (;;) {
         if (g_rt_http_parked != NULL) {
             int query = rt_gpu_query_job();
-            if (query == 2) {
+            if (query == 2 || query == 1) {
                 bool need_sub = false;
-                rt_http_gpu_release(&ring, conns, &need_sub, 0);
-                if (need_sub) io_uring_submit(&ring);
-            } else if (query == 1) {
-                rt_gpu_reset_stream();
-                bool need_sub = false;
-                rt_http_gpu_release(&ring, conns, &need_sub, 1);
-                if (need_sub) io_uring_submit(&ring);
+                if (query == 1) rt_gpu_reset_stream();
+                rt_http_gpu_release(&worker.rings[0].ring, &need_sub, query == 1);
+                if (need_sub) worker.rings[0].pending_submit = 1;
             }
         }
 
-        struct io_uring_cqe* cqe;
-        ret = io_uring_wait_cqe(&ring, &cqe);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-
-        unsigned head;
-        bool need_submit = false;
-
-        io_uring_for_each_cqe(&ring, head, cqe) {
-            uint64_t udata = cqe->user_data;
-            if (udata == RT_HTTP_UDATA_GPU) {
-                io_uring_cq_advance(&ring, 1);
-                rt_gpu_drain_eventfd();
-                int query = rt_gpu_query_job();
-                if (g_rt_http_parked == NULL) {
-                    if (query == 1) rt_gpu_reset_stream();
-                    rt_http_arm_gpu_poll(&ring, &need_submit);
-                } else if (query == 0) {
-                    rt_http_arm_gpu_poll(&ring, &need_submit);
-                } else if (query == 1) {
-                    rt_gpu_reset_stream();
-                    rt_http_gpu_release(&ring, conns, &need_submit, 1);
-                } else {
-                    rt_http_gpu_release(&ring, conns, &need_submit, 0);
-                }
-            } else if ((udata & 0xFFFFFFFF00000000ULL) == RT_HTTP_UDATA_GPU_TIMEOUT) {
-                io_uring_cq_advance(&ring, 1);
-                g_rt_http_gpu_timer_armed = false;
-                uint32_t gen = (uint32_t)udata;
-                if (g_rt_http_parked != NULL && gen == g_rt_http_gpu_gen) {
-                    int query = rt_gpu_query_job();
-                    if (query == 0) {
-                        rt_http_arm_gpu_timeout(&ring, &need_submit);
-                    } else if (query == 1) {
-                        rt_gpu_reset_stream();
-                        rt_http_gpu_release(&ring, conns, &need_submit, 1);
-                    } else {
-                        rt_http_gpu_release(&ring, conns, &need_submit, 0);
-                    }
-                }
-            } else if (udata == RT_HTTP_UDATA_ACCEPT) {
-                int client_fd = cqe->res;
-                io_uring_cq_advance(&ring, 1);
-                if (client_fd >= 0 && client_fd < RT_MAX_CONNS) {
-                    int nodelay = 1;
-                    (void)setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-                    rt_http_conn* c = &conns[client_fd];
-                    c->fd = client_fd;
-                    c->len = 0;
-                    c->header_scan_start = 0;
-                    c->tx_in_flight = false;
-                    c->close_after_tx = false;
-                    c->in_use = true;
-                    if (c->buffer == NULL) {
-                        c->cap = 8192;
-                        c->buffer = (uint8_t*)malloc(c->cap);
-                    }
-
-                    struct io_uring_sqe* rsqe = io_uring_get_sqe(&ring);
-                    if (!rsqe) {
-                        io_uring_submit(&ring);
-                        rsqe = io_uring_get_sqe(&ring);
-                    }
-                    if (rsqe) {
-                        io_uring_prep_recv_multishot(rsqe, client_fd, NULL, 0, 0);
-                        rsqe->flags |= IOSQE_BUFFER_SELECT;
-                        rsqe->buf_group = RT_BUF_GROUP_ID;
-                        rsqe->user_data = (uint64_t)client_fd;
-                        need_submit = true;
-                    }
-                }
-            } else if ((udata & RT_HTTP_UDATA_SEND) != 0) {
-                int client_fd = (int)(udata & 0xFFFFFFFFULL);
-                int res = cqe->res;
-                io_uring_cq_advance(&ring, 1);
-                if (client_fd >= 0 && client_fd < RT_MAX_CONNS) {
-                    rt_http_conn* c = &conns[client_fd];
-                    if (res > 0 && c->tx_total > 0 && (size_t)res < (c->tx_total - c->tx_sent)) {
-                        c->tx_sent += (size_t)res;
-                        size_t remaining = c->tx_total - c->tx_sent;
-                        struct io_uring_sqe* ssqe = io_uring_get_sqe(&ring);
-                        if (!ssqe) {
-                            io_uring_submit(&ring);
-                            ssqe = io_uring_get_sqe(&ring);
-                        }
-                        if (ssqe) {
-                            io_uring_prep_send(ssqe, client_fd, c->tx_buf + c->tx_sent, remaining, MSG_NOSIGNAL);
-                            ssqe->user_data = RT_HTTP_UDATA_SEND | (uint64_t)(uint32_t)client_fd;
-                            need_submit = true;
-                            continue;
-                        }
-                    }
-                    c->tx_in_flight = false;
-                    c->tx_sent = 0;
-                    c->tx_total = 0;
-                    if (res <= 0 || c->close_after_tx) {
-                        if (c->in_use) {
-                            if (c->close_after_tx) shutdown(client_fd, SHUT_RDWR);
-                            close(client_fd);
-                            c->in_use = false;
-                            c->len = 0;
-                            c->close_after_tx = false;
-                            if (c->tx_cap > 65536) {
-                                free(c->tx_buf);
-                                c->tx_buf = NULL;
-                                c->tx_cap = 0;
-                            }
-                            if (c->cap > 65536) {
-                                free(c->buffer);
-                                c->buffer = NULL;
-                                c->cap = 0;
-                            }
-                        }
-                    }
-                }
+        rt_http_flush(&worker);
+        if (!rt_http_has_cqe(&worker)) {
+            /* DEFER_TASKRUN posts completions only from io_uring_enter.
+               Waiting on one ring at a time would hide the others, so a
+               single ring blocks and several rings take turns. */
+            struct io_uring_cqe* waited = NULL;
+            int wait_rc;
+            if (worker.nrings <= 1) {
+                wait_rc = io_uring_wait_cqe(&worker.rings[0].ring, &waited);
             } else {
-                int client_fd = (int)udata;
-                int res = cqe->res;
-                unsigned flags = cqe->flags;
-                if (client_fd >= 0 && client_fd < RT_MAX_CONNS) {
-                    rt_http_conn* c = &conns[client_fd];
-                    if (res <= 0) {
-                        io_uring_cq_advance(&ring, 1);
-                        if (res == -ENOBUFS && c->in_use) {
-                            struct io_uring_sqe* rsqe = io_uring_get_sqe(&ring);
-                            if (!rsqe) {
-                                io_uring_submit(&ring);
-                                rsqe = io_uring_get_sqe(&ring);
-                            }
-                            if (rsqe) {
-                                io_uring_prep_recv_multishot(rsqe, client_fd, NULL, 0, 0);
-                                rsqe->flags |= IOSQE_BUFFER_SELECT;
-                                rsqe->buf_group = RT_BUF_GROUP_ID;
-                                rsqe->user_data = (uint64_t)client_fd;
-                                need_submit = true;
-                            }
-                        } else if (c->in_use) {
-                            close(client_fd);
-                            c->in_use = false;
-                            c->len = 0;
-                            if (c->tx_cap > 65536) {
-                                free(c->tx_buf);
-                                c->tx_buf = NULL;
-                                c->tx_cap = 0;
-                            }
-                            if (c->cap > 65536) {
-                                free(c->buffer);
-                                c->buffer = NULL;
-                                c->cap = 0;
-                            }
-                        }
-                    } else {
-                        int bid = flags >> IORING_CQE_BUFFER_SHIFT;
-                        uint8_t* in_data = buf_storage + bid * RT_BUF_SIZE;
-                        size_t bytes = (size_t)res;
-
-                        if (c->len + bytes > c->cap) {
-                            size_t ncap = c->cap * 2;
-                            while (ncap < c->len + bytes) ncap *= 2;
-                            uint8_t* nbuf = (uint8_t*)realloc(c->buffer, ncap);
-                            if (nbuf) {
-                                c->buffer = nbuf;
-                                c->cap = ncap;
-                            }
-                        }
-
-                        if (c->len + bytes <= c->cap) {
-                            memcpy(c->buffer + c->len, in_data, bytes);
-                            c->len += bytes;
-                        }
-
-                        io_uring_buf_ring_add(br, in_data, RT_BUF_SIZE, bid, io_uring_buf_ring_mask(RT_BUF_RING_SIZE), 0);
-                        io_uring_buf_ring_advance(br, 1);
-                        io_uring_cq_advance(&ring, 1);
-
-                        rt_http_drain_conn(conns, c, client_fd, &ring, &need_submit);
-
-                        if (c->in_use && !(flags & IORING_CQE_F_MORE)) {
-                            struct io_uring_sqe* rsqe = io_uring_get_sqe(&ring);
-                            if (!rsqe) {
-                                io_uring_submit(&ring);
-                                rsqe = io_uring_get_sqe(&ring);
-                            }
-                            if (rsqe) {
-                                io_uring_prep_recv_multishot(rsqe, client_fd, NULL, 0, 0);
-                                rsqe->flags |= IOSQE_BUFFER_SELECT;
-                                rsqe->buf_group = RT_BUF_GROUP_ID;
-                                rsqe->user_data = (uint64_t)client_fd;
-                                need_submit = true;
-                            }
-                        }
-                    }
-                } else {
-                    io_uring_cq_advance(&ring, 1);
+                struct __kernel_timespec ts;
+                memset(&ts, 0, sizeof(ts));
+                ts.tv_nsec = 1000000;
+                int idx = worker.wait_cursor % worker.nrings;
+                worker.wait_cursor++;
+                wait_rc = io_uring_wait_cqe_timeout(&worker.rings[idx].ring, &waited, &ts);
+                for (int i = 0; i < worker.nrings; i++) {
+                    if (worker.rings[i].active) io_uring_get_events(&worker.rings[i].ring);
                 }
             }
+            if (wait_rc == -EINTR) continue;
+            (void)waited;
         }
-        if (need_submit) {
-            io_uring_submit(&ring);
-        }
-    }
 
-    for (int i = 0; i < RT_MAX_CONNS; i++) {
-        if (conns[i].buffer) free(conns[i].buffer);
-        if (conns[i].tx_buf) free(conns[i].tx_buf);
+        int rings = worker.nrings;
+        for (int i = 0; i < rings; i++) {
+            if (worker.rings[i].active) rt_http_drain_cq(&worker.rings[i]);
+        }
+        for (int i = 0; i < worker.nrings; i++) rt_http_arm_accepts(&worker.rings[i], NULL);
+        rt_http_flush(&worker);
     }
-    free(conns);
-    io_uring_free_buf_ring(&ring, br, RT_BUF_RING_SIZE, RT_BUF_GROUP_ID);
-    free(buf_storage);
-    io_uring_queue_exit(&ring);
-    close(listen_fd);
     return NULL;
 }
 

@@ -261,6 +261,67 @@ static int trux_jwt_capture_claims(jwt_t *jwt, jwt_config_t *cfg) {
     return 0;
 }
 
+/* The checker and its parsed key are safe to reuse for one secret. Building
+   them parses a JWK and sets up HMAC on every call, which dominates verify
+   when the application uses one secret. The cache is thread-local: a checker
+   is not shared across workers. Token results are not cached. */
+#define RT_JWT_CACHE_SLOTS 4
+
+typedef struct rt_jwt_cache_slot {
+    char *secret;
+    size_t secret_len;
+    jwk_set_t *set;
+    jwt_checker_t *checker;
+} rt_jwt_cache_slot;
+
+static __thread rt_jwt_cache_slot rt_jwt_cache[RT_JWT_CACHE_SLOTS];
+static __thread int rt_jwt_cache_hand;
+static __thread trux_jwt_cap *rt_jwt_cb_cap;
+
+static int rt_jwt_cached_capture(jwt_t *jwt, jwt_config_t *cfg) {
+    jwt_config_t local;
+    (void)cfg;
+    memset(&local, 0, sizeof(local));
+    local.ctx = rt_jwt_cb_cap;
+    if (rt_jwt_cb_cap == NULL) return 1;
+    return trux_jwt_capture_claims(jwt, &local);
+}
+
+static RT_UNUSED void rt_jwt_cache_drop(rt_jwt_cache_slot *slot) {
+    if (slot->checker != NULL) jwt_checker_free(slot->checker);
+    if (slot->set != NULL) jwks_free(slot->set);
+    free(slot->secret);
+    memset(slot, 0, sizeof(*slot));
+}
+
+static RT_UNUSED jwt_checker_t *rt_jwt_cache_find(const char *secret, size_t len) {
+    for (int i = 0; i < RT_JWT_CACHE_SLOTS; i++) {
+        rt_jwt_cache_slot *slot = &rt_jwt_cache[i];
+        if (slot->checker != NULL && slot->secret_len == len &&
+            memcmp(slot->secret, secret, len) == 0) {
+            return slot->checker;
+        }
+    }
+    return NULL;
+}
+
+static RT_UNUSED void rt_jwt_cache_store(const char *secret, size_t len, jwk_set_t *set, jwt_checker_t *checker) {
+    rt_jwt_cache_slot *slot = &rt_jwt_cache[rt_jwt_cache_hand];
+    rt_jwt_cache_hand = (rt_jwt_cache_hand + 1) % RT_JWT_CACHE_SLOTS;
+    rt_jwt_cache_drop(slot);
+    slot->secret = (char *)malloc(len + 1);
+    if (slot->secret == NULL) {
+        jwt_checker_free(checker);
+        jwks_free(set);
+        return;
+    }
+    memcpy(slot->secret, secret, len);
+    slot->secret[len] = '\0';
+    slot->secret_len = len;
+    slot->set = set;
+    slot->checker = checker;
+}
+
 static RT_UNUSED trux_tuple_ptr_struct_15_trux_jwt_claims_error rt_jwt_verify(rt_arena *arena, rt_string token, rt_string secret) {
     char errbuf[512];
     errbuf[0] = '\0';
@@ -274,6 +335,7 @@ static RT_UNUSED trux_tuple_ptr_struct_15_trux_jwt_claims_error rt_jwt_verify(rt
     trux_jwt_cap cap;
     trux_jwt_claims *claims = NULL;
     int ok = 0;
+    int from_cache = 0;
     memset(&cap, 0, sizeof(cap));
 
     if (token.len == 0) {
@@ -289,56 +351,63 @@ static RT_UNUSED trux_tuple_ptr_struct_15_trux_jwt_claims_error rt_jwt_verify(rt
     if (token_c == NULL || secret_c == NULL) {
         goto done;
     }
-    {
+    checker = rt_jwt_cache_find(secret_c, strlen(secret_c));
+    if (checker != NULL) {
+        from_cache = 1;
+    } else {
         unsigned char *key_bytes = NULL;
         size_t key_len = 0;
         if (trux_jwt_hmac_key(secret_c, &key_bytes, &key_len, &key_pad, errbuf, sizeof(errbuf)) != 0) {
             goto done;
         }
         k = trux_jwt_b64url(key_bytes, key_len, errbuf, sizeof(errbuf));
-    }
-    if (k == NULL) {
-        goto done;
-    }
-    {
-        size_t jlen = strlen(k) + 40;
-        jwk_json = (char *)malloc(jlen);
-        if (jwk_json == NULL) {
+        if (k == NULL) {
+            goto done;
+        }
+        {
+            size_t jlen = strlen(k) + 40;
+            jwk_json = (char *)malloc(jlen);
+            if (jwk_json == NULL) {
+                trux_jwt_keep(errbuf, sizeof(errbuf), "jwt allocation failed");
+                goto done;
+            }
+            snprintf(jwk_json, jlen, "{\"kty\":\"oct\",\"k\":\"%s\",\"alg\":\"HS256\"}", k);
+        }
+        set = jwks_create(jwk_json);
+        if (set == NULL || jwks_error(set) || jwks_item_count(set) == 0) {
+            trux_jwt_keep(errbuf, sizeof(errbuf), set == NULL ? "jwt secret is not a valid HS256 key" : jwks_error_msg(set));
+            goto done;
+        }
+        checker = jwt_checker_new();
+        if (checker == NULL) {
             trux_jwt_keep(errbuf, sizeof(errbuf), "jwt allocation failed");
             goto done;
         }
-        snprintf(jwk_json, jlen, "{\"kty\":\"oct\",\"k\":\"%s\",\"alg\":\"HS256\"}", k);
-    }
-    set = jwks_create(jwk_json);
-    if (set == NULL || jwks_error(set) || jwks_item_count(set) == 0) {
-        trux_jwt_keep(errbuf, sizeof(errbuf), set == NULL ? "jwt secret is not a valid HS256 key" : jwks_error_msg(set));
-        goto done;
-    }
-    checker = jwt_checker_new();
-    if (checker == NULL) {
-        trux_jwt_keep(errbuf, sizeof(errbuf), "jwt allocation failed");
-        goto done;
-    }
-    if (jwt_checker_setkey(checker, JWT_ALG_HS256, jwks_item_get(set, 0)) != 0) {
-        trux_jwt_keep(errbuf, sizeof(errbuf), jwt_checker_error_msg(checker));
-        goto done;
-    }
-    {
-        jwt_alg_t algs[1];
-        algs[0] = JWT_ALG_HS256;
-        if (jwt_checker_setalgs(checker, algs, 1) != 0) {
+        if (jwt_checker_setkey(checker, JWT_ALG_HS256, jwks_item_get(set, 0)) != 0) {
+            trux_jwt_keep(errbuf, sizeof(errbuf), jwt_checker_error_msg(checker));
+            goto done;
+        }
+        {
+            jwt_alg_t algs[1];
+            algs[0] = JWT_ALG_HS256;
+            if (jwt_checker_setalgs(checker, algs, 1) != 0) {
+                trux_jwt_keep(errbuf, sizeof(errbuf), jwt_checker_error_msg(checker));
+                goto done;
+            }
+        }
+        if (jwt_checker_setcb(checker, rt_jwt_cached_capture, NULL) != 0) {
             trux_jwt_keep(errbuf, sizeof(errbuf), jwt_checker_error_msg(checker));
             goto done;
         }
     }
-    if (jwt_checker_setcb(checker, trux_jwt_capture_claims, &cap) != 0) {
-        trux_jwt_keep(errbuf, sizeof(errbuf), jwt_checker_error_msg(checker));
-        goto done;
-    }
+    rt_jwt_cb_cap = &cap;
+    jwt_checker_error_clear(checker);
     if (jwt_checker_verify(checker, token_c) != 0) {
+        rt_jwt_cb_cap = NULL;
         trux_jwt_keep(errbuf, sizeof(errbuf), jwt_checker_error_msg(checker));
         goto done;
     }
+    rt_jwt_cb_cap = NULL;
     if (cap.json == NULL || trux_jwt_claims_object(cap.json, errbuf, sizeof(errbuf)) != 0) {
         if (errbuf[0] == '\0') {
             trux_jwt_keep(errbuf, sizeof(errbuf), "jwt claims must be a JSON object");
@@ -356,14 +425,20 @@ static RT_UNUSED trux_tuple_ptr_struct_15_trux_jwt_claims_error rt_jwt_verify(rt
         claims = (trux_jwt_claims *)rt_arena_alloc(arena, sizeof(*claims));
         claims->doc = doc;
     }
+    if (!from_cache && checker != NULL && set != NULL) {
+        rt_jwt_cache_store(secret_c, strlen(secret_c), set, checker);
+        checker = NULL;
+        set = NULL;
+    }
     ok = 1;
 
 done:
+    rt_jwt_cb_cap = NULL;
     free(cap.json);
-    if (checker != NULL) {
+    if (!from_cache && checker != NULL) {
         jwt_checker_free(checker);
     }
-    if (set != NULL) {
+    if (!from_cache && set != NULL) {
         jwks_free(set);
     }
     free(jwk_json);

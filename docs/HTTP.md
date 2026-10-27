@@ -82,9 +82,9 @@ See [examples/projects/http_server](https://github.com/thea1lab/trux/tree/main/e
 The generated C includes `trux_http_runtime.h` when HTTP calls are used. On Linux, the runtime employs a shared-nothing thread-per-core architecture:
 
 1. **`SO_REUSEPORT`**: Each worker thread binds its own socket; incoming connections are load-balanced across threads in kernel space.
-2. **`io_uring`**: Each thread runs an independent submission and completion queue ring.
-3. **Kernel Buffer Rings (`io_uring_register_buf_ring`)**: The kernel selects receive buffers on packet arrival (`IOSQE_BUFFER_SELECT`), eliminating user-space memory allocations and read system calls.
-4. **Multishot Operations**: Single SQEs handle continuous `accept` and `recv` operations across connections.
+2. **`io_uring`**: Each thread runs its own submission and completion queue. When the kernel allows it, accepted sockets are direct descriptors, so they do not consume a process file descriptor. A thread adds another ring when its descriptor table is full. If direct descriptors are unavailable, the thread falls back to ordinary file descriptors.
+3. **Kernel Buffer Rings (`io_uring_register_buf_ring`)**: The kernel selects receive buffers on packet arrival (`IOSQE_BUFFER_SELECT`). The connection copies the bytes out and returns that buffer. An idle connection does not keep a private read buffer. A large body grows the buffer up to the existing limit, and the buffer is released once the request has been handled.
+4. **Accept and receive**: Each ring keeps one multishot accept and a small set of one-shot accepts in flight, because multishot accept can stall when many connections arrive together. Receive stays multishot for the life of the connection.
 5. **Memory Isolation**: Each request receives its own arena and `rt_context`, isolating allocations between requests and worker threads.
 6. **GPU requests**: A handler may call `gpu.finish` instead of responding. The arena stays alive until the continuation copies the response into the connection buffer. The worker keeps polling the ring while that kernel runs. See [GPU.md](GPU.md) and [TXM.md](TXM.md).
 

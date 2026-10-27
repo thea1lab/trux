@@ -916,6 +916,161 @@ func main() int {
 	}
 }
 
+func TestHTTPKeepAliveLargeBodyAndDirectRings(t *testing.T) {
+	requireCC(t)
+
+	port := freeTCPPort(t)
+	path := writeTempSource(t, fmt.Sprintf(`package main
+import "http"
+
+func handle(request int) int {
+    http.text(request, 200, http.body(request))
+    return 0
+}
+
+func main() int {
+    http.post("/echo", handle)
+    http.listen(%d)
+    return 0
+}`, port))
+	outputPath := filepath.Join(t.TempDir(), "server")
+	if err := buildFile(path, outputPath); err != nil {
+		t.Fatal(err)
+	}
+
+	start := func(t *testing.T, extra []string) *exec.Cmd {
+		t.Helper()
+		cmd := exec.Command(outputPath)
+		cmd.Env = append(os.Environ(), extra...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}
+		})
+		deadline := time.Now().Add(3 * time.Second)
+		ping := []byte("POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nping")
+		for time.Now().Before(deadline) {
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 100*time.Millisecond)
+			if err != nil {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			_ = conn.SetDeadline(time.Now().Add(300 * time.Millisecond))
+			_, _ = conn.Write(ping)
+			buf := make([]byte, 512)
+			n, readErr := conn.Read(buf)
+			_ = conn.Close()
+			if readErr == nil && bytes.Contains(buf[:n], []byte("200")) && bytes.Contains(buf[:n], []byte("ping")) {
+				return cmd
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("server did not answer: %s", stderr.String())
+		return nil
+	}
+
+	request := func(body string) string {
+		return fmt.Sprintf("POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s", len(body), body)
+	}
+	readResponse := func(t *testing.T, conn net.Conn, pending *[]byte) (int, string) {
+		t.Helper()
+		tmp := make([]byte, 32*1024)
+		for {
+			if bytes.Contains(*pending, []byte("\r\n\r\n")) {
+				head, rest, _ := bytes.Cut(*pending, []byte("\r\n\r\n"))
+				status, _, _ := strings.Cut(string(head), "\r\n")
+				length := -1
+				for _, line := range strings.Split(string(head), "\r\n") {
+					if strings.HasPrefix(strings.ToLower(line), "content-length:") {
+						length, _ = strconv.Atoi(strings.TrimSpace(line[len("content-length:"):]))
+					}
+				}
+				if length >= 0 && len(rest) >= length {
+					code := 0
+					fmt.Sscanf(status, "HTTP/1.1 %d", &code)
+					body := string(rest[:length])
+					*pending = append([]byte(nil), rest[length:]...)
+					return code, body
+				}
+			}
+			n, err := conn.Read(tmp)
+			if n > 0 {
+				*pending = append(*pending, tmp[:n]...)
+			}
+			if err != nil {
+				t.Fatalf("read response: %v\n%s", err, *pending)
+			}
+		}
+	}
+
+	t.Run("direct", func(t *testing.T) {
+		_ = start(t, []string{"TRUX_HTTP_REQUIRE_DIRECT=1", "TRUX_HTTP_DIRECT_SLOTS=8"})
+		conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		large := strings.Repeat("a", 200*1024)
+		if _, err := conn.Write([]byte(request(large) + request("ok"))); err != nil {
+			t.Fatal(err)
+		}
+		var pending []byte
+		code, body := readResponse(t, conn, &pending)
+		if code != 200 || body != large {
+			t.Fatalf("large response = %d %d bytes", code, len(body))
+		}
+		code, body = readResponse(t, conn, &pending)
+		if code != 200 || body != "ok" {
+			t.Fatalf("second response = %d %q", code, body)
+		}
+
+		held := make([]net.Conn, 20)
+		for i := range held {
+			held[i], err = net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+			if err != nil {
+				t.Fatalf("dial %d: %v", i, err)
+			}
+			defer held[i].Close()
+			if _, err := held[i].Write([]byte(request("x"))); err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
+		}
+		for i := range held {
+			_ = held[i].SetDeadline(time.Now().Add(2 * time.Second))
+			var pending []byte
+			code, body := readResponse(t, held[i], &pending)
+			if code != 200 || body != "x" {
+				t.Fatalf("conn %d = %d %q", i, code, body)
+			}
+		}
+	})
+
+	t.Run("file descriptors", func(t *testing.T) {
+		_ = start(t, []string{"TRUX_HTTP_NO_DIRECT=1"})
+		conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.WriteString(conn, request("fd")); err != nil {
+			t.Fatal(err)
+		}
+		var pending []byte
+		code, body := readResponse(t, conn, &pending)
+		if code != 200 || body != "fd" {
+			t.Fatalf("fallback response = %d %q", code, body)
+		}
+	})
+}
+
 func TestBuildCommandCompilesAndRunsHTTPMultiFile(t *testing.T) {
 	requireCC(t)
 
@@ -3895,6 +4050,22 @@ func main() int {
     if badErr != nil {
         print("not-object")
     }
+    let again *jwt.Claims, againErr error = jwt.verify(token, secret)
+    if againErr != nil || jwt.getString(again, "sub") != "ada" {
+        print("reuse-fail")
+    } else {
+        print("reuse-ok")
+    }
+    let _, corrupt error = jwt.verify(token + "x", secret)
+    if corrupt != nil {
+        print("corrupt")
+    }
+    let goodAfter *jwt.Claims, goodAfterErr error = jwt.verify(token, secret)
+    if goodAfterErr != nil || jwt.getString(goodAfter, "sub") != "ada" {
+        print("after-fail")
+    } else {
+        print("after-ok")
+    }
     return 0
 }
 `
@@ -3903,7 +4074,7 @@ func main() int {
 	if err := runFile(&out, path); err != nil {
 		t.Fatalf("runFile failed: %v", err)
 	}
-	want := "bad\nshort-ok\nnot-object\n"
+	want := "bad\nshort-ok\nnot-object\nreuse-ok\ncorrupt\nafter-ok\n"
 	if out.String() != want {
 		t.Fatalf("got output %q, want %q", out.String(), want)
 	}

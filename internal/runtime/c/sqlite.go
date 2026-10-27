@@ -69,32 +69,31 @@ static void rt_sqlite_sleep_us(long usec) {
     nanosleep(&ts, NULL);
 }
 
+/* Give a lock a few milliseconds, then let the caller see SQLITE_BUSY.
+ * Sleeping for seconds here stops every request on a single-threaded server. */
 static int rt_sqlite_busy_handler(void* ptr, int count) {
     (void)ptr;
-    if (count < 5) {
+    if (count < 4) {
         sched_yield();
         return 1;
     }
-    if (count < 500) {
-        rt_sqlite_sleep_us(25);
-        return 1;
-    }
-    if (count < 25000) {
-        rt_sqlite_sleep_us(100);
+    if (count < 20) {
+        rt_sqlite_sleep_us(200);
         return 1;
     }
     return 0;
 }
 
-/* WAL checkpoint policy: checking + truncating every 2,000 frames fsyncs the
- * database every ~8 MB of WAL, which bottlenecks single-row INSERT throughput.
- * Checkpoint less often instead, but keep the WAL small enough that it does not
- * dominate the container memory limit: cap it at roughly 1/8 of that limit.
- * Retries are rate-limited so a checkpoint that cannot complete (active
- * readers) is not re-attempted on every single commit. */
+/* WAL checkpoint policy. A RESTART of a large log runs on the caller thread and
+ * stops every request until it finishes. Passive checkpoints of about 4 MiB
+ * (1000 frames) stay short enough that one core can drain the queue afterward.
+ * journal_size_limit still caps the file. If a reader blocks the checkpoint,
+ * the next try waits a few commits, unless the log has already hit the
+ * memory-based ceiling. */
 #define RT_SQLITE_CHECKPOINT_FRAMES_MIN 2000
 #define RT_SQLITE_CHECKPOINT_FRAMES_MAX 20000
-#define RT_SQLITE_CHECKPOINT_COMMITS 500
+#define RT_SQLITE_CHECKPOINT_BATCH 1000
+#define RT_SQLITE_CHECKPOINT_RETRY 32
 
 static long long rt_sqlite_read_limit_file(const char* path) {
     FILE* f = fopen(path, "r");
@@ -129,19 +128,24 @@ static int rt_sqlite_default_checkpoint_frames(void) {
 
 static int rt_sqlite_wal_hook(void* arg, sqlite3* db, const char* zDb, int nEntry) {
     trux_sqlite_db* tdb = (trux_sqlite_db*)arg;
-    int frames = (tdb != NULL) ? tdb->checkpoint_frames : RT_SQLITE_CHECKPOINT_FRAMES_MAX;
-    if (nEntry < frames) {
+    int ceiling = (tdb != NULL) ? tdb->checkpoint_frames : RT_SQLITE_CHECKPOINT_FRAMES_MAX;
+    if (ceiling < RT_SQLITE_CHECKPOINT_BATCH) ceiling = RT_SQLITE_CHECKPOINT_BATCH;
+    if (nEntry < RT_SQLITE_CHECKPOINT_BATCH) {
         if (tdb != NULL) tdb->commits_since_ckpt = 0;
         return SQLITE_OK;
     }
-    if (tdb != NULL) {
-        if (tdb->commits_since_ckpt < RT_SQLITE_CHECKPOINT_COMMITS) {
-            tdb->commits_since_ckpt++;
-            return SQLITE_OK;
-        }
-        tdb->commits_since_ckpt = 0;
+    if (tdb != NULL && nEntry < ceiling && tdb->commits_since_ckpt > 0 &&
+        tdb->commits_since_ckpt < RT_SQLITE_CHECKPOINT_RETRY) {
+        tdb->commits_since_ckpt++;
+        return SQLITE_OK;
     }
-    sqlite3_wal_checkpoint_v2(db, zDb, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL);
+    int in_log = 0;
+    int checkpointed = 0;
+    sqlite3_wal_checkpoint_v2(db, zDb, SQLITE_CHECKPOINT_PASSIVE, &in_log, &checkpointed);
+    if (tdb != NULL) {
+        if (in_log > 0 && checkpointed < in_log) tdb->commits_since_ckpt = 1;
+        else tdb->commits_since_ckpt = 0;
+    }
     return SQLITE_OK;
 }
 
@@ -175,6 +179,16 @@ static RT_UNUSED trux_tuple_ptr_struct_14_trux_sqlite_db_error rt_sqlite_open(rt
 
 static RT_UNUSED trux_tuple_ptr_struct_14_trux_sqlite_db_error rt_sqlite_open_thread_local(rt_arena* arena, rt_string path) {
     rt_check_string(path);
+    /* An empty path asks for the connection this thread already opened.
+       The hot path then skips reading the environment and reapplying pragmas. */
+    if (path.len == 0) {
+        for (size_t i = 0; i < g_trux_sqlite_tls_count; i++) {
+            if (g_trux_sqlite_tls_cache[i].db != NULL && g_trux_sqlite_tls_cache[i].db->is_open) {
+                return RT_LIT(trux_tuple_ptr_struct_14_trux_sqlite_db_error, g_trux_sqlite_tls_cache[i].db, NULL);
+            }
+        }
+        return RT_LIT(trux_tuple_ptr_struct_14_trux_sqlite_db_error, NULL, rt_error_new(arena, RT_LIT(rt_string, (const uint8_t*)"sqlite thread-local connection is not open", 42)));
+    }
     for (size_t i = 0; i < g_trux_sqlite_tls_count; i++) {
         if (g_trux_sqlite_tls_cache[i].db != NULL &&
             g_trux_sqlite_tls_cache[i].db->is_open &&
