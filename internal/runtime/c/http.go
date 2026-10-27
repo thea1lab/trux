@@ -34,6 +34,7 @@ const HTTPSource = `
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <sys/sysinfo.h>
 #include <unistd.h>
 
 #ifndef SO_REUSEPORT
@@ -301,10 +302,9 @@ static RT_UNUSED bool rt_http_contains_token_ci(const uint8_t* data, size_t len,
 static RT_UNUSED ssize_t rt_http_find_header_end(const uint8_t* buf, size_t len, size_t start) {
     if (len < 4) return -1;
     if (start > 3) start -= 3;
-    for (size_t i = start; i + 3 < len; i++) {
-        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
-            return (ssize_t)(i + 4);
-        }
+    const void* p = memmem(buf + start, len - start, "\r\n\r\n", 4);
+    if (p != NULL) {
+        return (ssize_t)((const uint8_t*)p - buf + 4);
     }
     return -1;
 }
@@ -702,8 +702,40 @@ static RT_UNUSED void rt_http_arm_accept(rt_http_ring* r, int multi, bool* need_
     rt_http_mark_submit(r, need_submit);
 }
 
+static RT_UNUSED int rt_http_mem_ok(void) {
+    static __thread uint64_t last_check_ns = 0;
+    static __thread int cached_ok = 1;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    if (now_ns - last_check_ns < 100000000ULL) {
+        return cached_ok;
+    }
+    last_check_ns = now_ns;
+    const char* env = getenv("TRUX_HTTP_MEM_FLOOR_MB");
+    if (env == NULL || env[0] == '\0') {
+        cached_ok = 1;
+        return 1;
+    }
+    char* end = NULL;
+    long floor_mb = strtol(env, &end, 10);
+    if (end == env || floor_mb <= 0) {
+        cached_ok = 1;
+        return 1;
+    }
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        unsigned long mem_unit = si.mem_unit > 0 ? si.mem_unit : 1;
+        long free_mb = (long)(((unsigned long long)si.freeram * mem_unit) / (1024ULL * 1024ULL));
+        cached_ok = (free_mb >= floor_mb);
+    } else {
+        cached_ok = 1;
+    }
+    return cached_ok;
+}
+
 static RT_UNUSED void rt_http_arm_accepts(rt_http_ring* r, bool* need_submit) {
-    if (r == NULL || !r->active) return;
+    if (r == NULL || !r->active || !rt_http_mem_ok()) return;
     if (!r->multi_on && rt_http_ring_has_room(r)) rt_http_arm_accept(r, 1, need_submit);
     unsigned want = rt_http_single_target(r);
     while ((unsigned)r->singles < want && rt_http_ring_has_room(r)) {

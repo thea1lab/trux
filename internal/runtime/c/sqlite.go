@@ -92,7 +92,7 @@ static int rt_sqlite_busy_handler(void* ptr, int count) {
  * memory-based ceiling. */
 #define RT_SQLITE_CHECKPOINT_FRAMES_MIN 2000
 #define RT_SQLITE_CHECKPOINT_FRAMES_MAX 20000
-#define RT_SQLITE_CHECKPOINT_BATCH 1000
+#define RT_SQLITE_CHECKPOINT_BATCH 250
 #define RT_SQLITE_CHECKPOINT_RETRY 32
 
 static long long rt_sqlite_read_limit_file(const char* path) {
@@ -127,25 +127,11 @@ static int rt_sqlite_default_checkpoint_frames(void) {
 }
 
 static int rt_sqlite_wal_hook(void* arg, sqlite3* db, const char* zDb, int nEntry) {
-    trux_sqlite_db* tdb = (trux_sqlite_db*)arg;
-    int ceiling = (tdb != NULL) ? tdb->checkpoint_frames : RT_SQLITE_CHECKPOINT_FRAMES_MAX;
-    if (ceiling < RT_SQLITE_CHECKPOINT_BATCH) ceiling = RT_SQLITE_CHECKPOINT_BATCH;
-    if (nEntry < RT_SQLITE_CHECKPOINT_BATCH) {
-        if (tdb != NULL) tdb->commits_since_ckpt = 0;
-        return SQLITE_OK;
-    }
-    if (tdb != NULL && nEntry < ceiling && tdb->commits_since_ckpt > 0 &&
-        tdb->commits_since_ckpt < RT_SQLITE_CHECKPOINT_RETRY) {
-        tdb->commits_since_ckpt++;
-        return SQLITE_OK;
-    }
-    int in_log = 0;
-    int checkpointed = 0;
-    sqlite3_wal_checkpoint_v2(db, zDb, SQLITE_CHECKPOINT_PASSIVE, &in_log, &checkpointed);
-    if (tdb != NULL) {
-        if (in_log > 0 && checkpointed < in_log) tdb->commits_since_ckpt = 1;
-        else tdb->commits_since_ckpt = 0;
-    }
+    (void)arg;
+    /* Checkpoint on the commit that crosses the batch. Waiting lets the log
+       grow into one long pause on the request thread. */
+    if (nEntry < RT_SQLITE_CHECKPOINT_BATCH) return SQLITE_OK;
+    sqlite3_wal_checkpoint_v2(db, zDb, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
     return SQLITE_OK;
 }
 
